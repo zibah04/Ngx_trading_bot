@@ -1,0 +1,53 @@
+# Standalone private deployment: docker compose --env-file .env -f compose.private.yaml up --build -d
+services:
+  dashboard:
+    build: .
+    restart: unless-stopped
+    environment:
+      NGX_DATABASE_PATH: /app/data/ngx_dashboard.db
+    volumes:
+      - ngx-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    stop_grace_period: 60s
+    mem_limit: 1g
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  proxy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    environment:
+      NGX_DOMAIN: ${NGX_DOMAIN:?Set a public DNS hostname for HTTPS}
+      NGX_AUTH_USER: ${NGX_AUTH_USER:?Set a dashboard username}
+      NGX_AUTH_HASH: ${NGX_AUTH_HASH:?Set a Caddy bcrypt password hash}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  ngx-data:
+  caddy-data:
+  caddy-config:

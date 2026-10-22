@@ -1,8 +1,13 @@
 .git
+.github
 .venv
 venv
 __pycache__
 *.py[cod]
 *.db
+*.db-*
+data
+backups
 .env
+.env.*
 .pytest_cache

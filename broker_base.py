@@ -41,6 +41,7 @@ class OrderBook:
     asks: List[OrderBookLevel]
     reference_price: float
     timestamp: float
+    previous_close_price: Optional[float] = None
 
     @property
     def is_liquid(self) -> bool:

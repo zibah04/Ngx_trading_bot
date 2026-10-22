@@ -1,0 +1,12 @@
+{$NGX_DOMAIN} {
+    basic_auth {
+        {$NGX_AUTH_USER} {$NGX_AUTH_HASH}
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        -Server
+    }
+    reverse_proxy dashboard:8501
+}

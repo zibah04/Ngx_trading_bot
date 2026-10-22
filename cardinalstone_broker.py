@@ -102,7 +102,12 @@ class CardinalStoneBroker(BaseBroker):
         asks = [OrderBookLevel(price=float(a["price"]), quantity=int(a["volume"])) for a in data.get("asks", [])]
         ref = float(data.get("reference_price") or (asks[0].price if asks else 0.0))
 
-        return OrderBook(symbol=symbol, bids=bids, asks=asks, reference_price=ref, timestamp=time.time())
+        # These normalized fields must be verified against the broker's sandbox.
+        # Do not replace missing market timestamps with local receipt time.
+        return OrderBook(symbol=symbol, bids=bids, asks=asks, reference_price=ref,
+                         timestamp=float(data.get("timestamp", 0)),
+                         previous_close_price=(float(data["previous_close_price"])
+                                               if data.get("previous_close_price") is not None else None))
 
     async def submit_order(
         self,

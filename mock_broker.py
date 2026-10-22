@@ -7,6 +7,7 @@ import asyncio
 import time
 import uuid
 import random
+import math
 from typing import Dict, List, Optional
 from python_bot.broker_base import (
     BaseBroker,
@@ -30,7 +31,7 @@ class MockBroker(BaseBroker):
     }
 
     def __init__(self, initial_cash_naira: float = 2_000_000.0):
-        if initial_cash_naira <= 0:
+        if not math.isfinite(initial_cash_naira) or initial_cash_naira <= 0:
             raise ValueError("Initial cash must be positive.")
         self.cash_balance = initial_cash_naira
         self.reference_prices: Dict[str, float] = self.INITIAL_STOCKS.copy()
@@ -132,7 +133,8 @@ class MockBroker(BaseBroker):
             for i in range(5)
         ]
 
-        return OrderBook(symbol=symbol, bids=bids, asks=asks, reference_price=ref, timestamp=time.time())
+        return OrderBook(symbol=symbol, bids=bids, asks=asks, reference_price=ref,
+                         timestamp=time.time(), previous_close_price=self.INITIAL_STOCKS.get(symbol))
 
     async def submit_order(
         self,
@@ -142,8 +144,10 @@ class MockBroker(BaseBroker):
         price: float,
         quantity: int,
     ) -> OrderResult:
-        if quantity <= 0:
+        if type(quantity) is not int or quantity <= 0:
             raise ValueError(f"Quantity must be a positive integer, got {quantity}")
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError("Price must be finite and positive.")
 
         fee_pct = 0.015
         gross_value = round(price * quantity, 2)

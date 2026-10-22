@@ -1,5 +1,5 @@
 """
-NGX Algorithmic Trading Bot - Production Async Execution Engine
+NGX Algorithmic Trading Bot - Async Execution Engine
 Monitors watchlists concurrently, computes true acquisition costs including fees,
 executes discount limit buys, and places net target profit limit sells over N cycles.
 """
@@ -9,6 +9,7 @@ import math
 import time
 import logging
 from typing import Any, Dict, Optional, List
+from instance_lock import InstanceLock
 
 from python_bot.broker_base import (
     BaseBroker,
@@ -43,16 +44,141 @@ class NGXQuantTradingEngine:
         self._running = False
         self._worker_tasks: List[asyncio.Task] = []
         self._active_orders_by_symbol: Dict[str, Optional[str]] = {}
+        self._submission_lock = asyncio.Lock()
+        self.last_error: Optional[str] = None
+        self._expected_orders = {}
 
     def activate_kill_switch(self, reason: str = "Manual emergency trigger") -> None:
         """Safety kill-switch to pause all trading immediately."""
         self.kill_switch_active = True
+        self.last_error = reason
         logger.critical("🚨 KILL SWITCH ACTIVATED! Reason: %s. Pausing order submissions.", reason)
 
     def deactivate_kill_switch(self) -> None:
         """Resume trading after review."""
+        if self._running or any(self._active_orders_by_symbol.values()):
+            raise RuntimeError("Stop and reconcile outstanding orders before clearing the kill switch.")
         self.kill_switch_active = False
         logger.info("✅ Kill switch deactivated. Trading resumed.")
+
+    def validate_order_book(self, symbol: str, book: OrderBook) -> None:
+        """Fail closed when price, freshness, depth, or daily reference is unusable."""
+        if book.symbol != symbol or not book.is_liquid:
+            raise ValueError("Order book has the wrong symbol or no liquidity.")
+        now = time.time()
+        if (not math.isfinite(book.timestamp) or book.timestamp > now + 1
+                or now - book.timestamp > self.config.safety.max_quote_age_seconds):
+            raise ValueError("Order book is stale or has an invalid timestamp.")
+        for level in book.bids + book.asks:
+            if (not math.isfinite(level.price) or level.price <= 0
+                    or type(level.quantity) is not int or level.quantity <= 0):
+                raise ValueError("Order book contains invalid price or depth.")
+        bid, ask = book.best_bid, book.best_ask
+        if (book.bids != sorted(book.bids, key=lambda level: level.price, reverse=True)
+                or book.asks != sorted(book.asks, key=lambda level: level.price)):
+            raise ValueError("Order book levels must be sorted by price.")
+        if bid > ask or (ask - bid) / ask * 100 > self.config.safety.max_spread_pct:
+            raise ValueError("Order book is crossed or spread exceeds the configured limit.")
+        close = book.previous_close_price
+        if close is None or not math.isfinite(close) or close <= 0:
+            raise ValueError("A verified previous close is required for daily price limits.")
+        if not math.isfinite(book.reference_price) or book.reference_price <= 0:
+            raise ValueError("Order book has an invalid reference price.")
+        limit = self.config.safety.daily_price_limit_pct
+        if any(abs(price / close - 1) * 100 > limit + 1e-9
+               for price in (bid, ask, book.reference_price)):
+            raise ValueError("Market price exceeds the daily price limit.")
+
+    async def _submit_checked_order(self, *, symbol, side, order_type, price, quantity):
+        async with self._submission_lock:
+            if not self._running or self.kill_switch_active:
+                raise RuntimeError("Trading halted before order submission.")
+            if not math.isfinite(price) or price <= 0 or type(quantity) is not int or quantity <= 0:
+                raise ValueError("Invalid order price or quantity.")
+            if side == OrderSide.BUY:
+                cash = await self.broker.get_cash_balance()
+                fees = self.config.watchlists[symbol].entry_fee_pct
+                outlay, _ = self.calculate_true_acquisition_cost(quantity, price, fees)
+                if not math.isfinite(cash) or outlay > cash:
+                    raise ValueError("Insufficient available cash for this order including fees.")
+            # A halt may arrive during the balance request.
+            if not self._running or self.kill_switch_active:
+                raise RuntimeError("Trading halted before order submission.")
+            latest_book = await self.broker.get_order_book(symbol)
+            self.validate_order_book(symbol, latest_book)
+            close = latest_book.previous_close_price
+            band = self.config.safety.daily_price_limit_pct / 100
+            if not close * (1 - band) - 1e-9 <= price <= close * (1 + band) + 1e-9:
+                raise ValueError("Order price is outside the daily price band.")
+            if not self._running or self.kill_switch_active:
+                raise RuntimeError("Trading halted before order submission.")
+            result = await self.broker.submit_order(
+                symbol=symbol, side=side, order_type=order_type, price=price, quantity=quantity,
+            )
+            # Retain the ID before any further await, including database writes.
+            self._active_orders_by_symbol[symbol] = result.order_id
+            self._expected_orders[result.order_id] = (symbol, side, order_type, quantity, price)
+            self._validate_order_result(result, symbol, result.order_id)
+            return result
+
+    def _validate_order_result(self, order: OrderResult, symbol: str, order_id: str) -> None:
+        if not order_id or order.order_id != order_id or order.symbol != symbol:
+            raise ValueError("Broker returned an invalid order identity.")
+        expected = self._expected_orders.get(order_id)
+        if expected and (order.symbol, order.side, order.order_type, order.quantity, order.price) != expected:
+            raise ValueError("Broker order does not match the submitted order.")
+        if (type(order.quantity) is not int or order.quantity <= 0
+                or type(order.filled_quantity) is not int
+                or not 0 <= order.filled_quantity <= order.quantity
+                or not math.isfinite(order.price) or order.price <= 0
+                or not math.isfinite(order.fee_incurred) or order.fee_incurred < 0
+                or not math.isfinite(order.average_fill_price)
+                or (order.filled_quantity > 0 and order.average_fill_price <= 0)
+                or (order.status == OrderStatus.FILLED and order.filled_quantity != order.quantity)):
+            raise ValueError("Broker returned an invalid fill or fee.")
+
+    async def _save_order_snapshot(self, order: OrderResult) -> None:
+        await self.db.save_order({
+            "order_id": order.order_id, "symbol": order.symbol,
+            "side": order.side.value, "order_type": order.order_type.value,
+            "target_price": order.price, "quantity": order.quantity,
+            "filled_quantity": order.filled_quantity,
+            "average_fill_price": order.average_fill_price,
+            "status": order.status.value, "fee_incurred": order.fee_incurred,
+            "cycle_index": 0, "created_at": order.created_at, "updated_at": order.updated_at,
+        })
+
+    async def _cancel_and_verify(self, symbol: str, order_id: str) -> OrderResult:
+        """A cancellation acknowledgement alone does not establish the final state."""
+        async with asyncio.timeout(self.config.safety.cancellation_timeout_seconds):
+            order = await self.broker.get_order_status(order_id)
+            self._validate_order_result(order, symbol, order_id)
+            terminal = (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED)
+            if order.status not in terminal:
+                await self.broker.cancel_order(order_id)
+                while True:
+                    order = await self.broker.get_order_status(order_id)
+                    self._validate_order_result(order, symbol, order_id)
+                    if order.status in terminal:
+                        break
+                    await asyncio.sleep(0.1)
+            await self._save_order_snapshot(order)
+            self._active_orders_by_symbol.pop(symbol, None)
+            return order
+
+    async def _cancel_known_orders(self) -> None:
+        failures = []
+        for symbol, order_id in list(self._active_orders_by_symbol.items()):
+            if not order_id:
+                continue
+            try:
+                await self._cancel_and_verify(symbol, order_id)
+            except Exception:
+                failures.append(symbol)
+                logger.exception("Cannot confirm final order state for %s; reconciliation required", symbol)
+        if failures:
+            self.activate_kill_switch("Unconfirmed cancellation for " + ", ".join(failures))
+            raise RuntimeError(self.last_error)
 
     # -------------------------------------------------------------------------
     # Core Mathematical Formulas (Exact Quant Specification)
@@ -174,32 +300,19 @@ class NGXQuantTradingEngine:
         Monitors order status: SUBMITTED -> PARTIALLY_FILLED -> FILLED.
         Persists state updates to SQLite.
         """
-        start_time = time.time()
+        start_time = time.monotonic()
         while self._running:
             if self.kill_switch_active:
-                logger.warning("Kill switch triggered while tracking order %s. Stopping tracking.", order_id)
+                await self._cancel_and_verify(symbol, order_id)
                 break
 
             order_status = await self._execute_with_retry(self.broker.get_order_status, order_id)
+            self._validate_order_result(order_status, symbol, order_id)
 
-            # Persist order status snapshot
-            await self.db.save_order({
-                "order_id": order_status.order_id,
-                "symbol": order_status.symbol,
-                "side": order_status.side.value,
-                "order_type": order_status.order_type.value,
-                "target_price": order_status.price,
-                "quantity": order_status.quantity,
-                "filled_quantity": order_status.filled_quantity,
-                "average_fill_price": order_status.average_fill_price,
-                "status": order_status.status.value,
-                "fee_incurred": order_status.fee_incurred,
-                "cycle_index": 0,
-                "created_at": order_status.created_at,
-                "updated_at": order_status.updated_at,
-            })
+            await self._save_order_snapshot(order_status)
 
             if order_status.status == OrderStatus.FILLED:
+                self._active_orders_by_symbol.pop(symbol, None)
                 logger.info(
                     "🎯 Order %s FILLED: %s %d units of %s @ ₦%.2f",
                     order_id, order_status.side.value, order_status.filled_quantity,
@@ -208,6 +321,7 @@ class NGXQuantTradingEngine:
                 return order_status
 
             if order_status.status in (OrderStatus.CANCELLED, OrderStatus.REJECTED):
+                self._active_orders_by_symbol.pop(symbol, None)
                 raise RuntimeError(f"Order {order_id} was {order_status.status.value}")
 
             if order_status.status == OrderStatus.PARTIALLY_FILLED:
@@ -217,9 +331,11 @@ class NGXQuantTradingEngine:
                 )
 
             # Timeout check
-            if time.time() - start_time > timeout_seconds:
+            if time.monotonic() - start_time > timeout_seconds:
                 logger.warning("⏱️ Order %s timed out after %ds. Cancelling order...", order_id, int(timeout_seconds))
-                await self.broker.cancel_order(order_id)
+                final = await self._cancel_and_verify(symbol, order_id)
+                if final.status == OrderStatus.FILLED:
+                    return final
                 raise TimeoutError(f"Order {order_id} timed out without full fill.")
 
             await asyncio.sleep(polling_interval)
@@ -280,6 +396,11 @@ class NGXQuantTradingEngine:
                 continue
 
             current_price = order_book.best_ask or order_book.reference_price
+            try:
+                self.validate_order_book(symbol, order_book)
+            except ValueError as exc:
+                self.activate_kill_switch(f"Unsafe market data for {symbol}: {exc}")
+                break
             logger.info(
                 "📊 [%s] Order Book Liquid | Ref/Ask Price: ₦%.2f | Best Bid: ₦%.2f | Spread: ₦%.2f",
                 symbol, current_price, order_book.best_bid or 0.0, order_book.spread or 0.0
@@ -287,6 +408,10 @@ class NGXQuantTradingEngine:
 
             # 2. Limit Buy Order Calculation
             buy_price = self.calculate_buy_price(current_price, strat.x_buy_discount_pct)
+            close = order_book.previous_close_price
+            if buy_price < close * (1 - self.config.safety.daily_price_limit_pct / 100):
+                self.activate_kill_switch(f"Buy limit outside daily price band for {symbol}")
+                break
             quantity = self.calculate_whole_share_quantity(
                 strat.z_capital_budget_naira, buy_price, strat.entry_fee_pct
             )
@@ -313,7 +438,7 @@ class NGXQuantTradingEngine:
                     last_updated=time.time(),
                 )
                 buy_order = await self._execute_with_retry(
-                    self.broker.submit_order,
+                    self._submit_checked_order,
                     symbol=symbol,
                     side=OrderSide.BUY,
                     order_type=OrderType.LIMIT,
@@ -352,13 +477,15 @@ class NGXQuantTradingEngine:
             exec_quantity = filled_buy.filled_quantity
 
             # 4. True Cost & Target Sell Price Calculation
-            actual_total_outlay, actual_avg_cost = self.calculate_true_acquisition_cost(
-                exec_quantity, exec_buy_price, strat.entry_fee_pct
-            )
+            actual_total_outlay = round(exec_quantity * exec_buy_price + filled_buy.fee_incurred, 2)
+            actual_avg_cost = actual_total_outlay / exec_quantity
 
             target_sell_price = self.calculate_target_sell_price(
                 actual_avg_cost, strat.y_profit_target_pct, strat.exit_fee_pct
             )
+            if target_sell_price > close * (1 + self.config.safety.daily_price_limit_pct / 100):
+                self.activate_kill_switch(f"Sell target outside daily price band for {symbol}; holdings need review")
+                break
 
             logger.info(
                 "📈 [%s] Buy Executed. True Cost/sh: ₦%.4f. Target Sell: ₦%.2f (Net %.1f%% Profit)",
@@ -377,7 +504,7 @@ class NGXQuantTradingEngine:
                     last_updated=time.time(),
                 )
                 sell_order = await self._execute_with_retry(
-                    self.broker.submit_order,
+                    self._submit_checked_order,
                     symbol=symbol,
                     side=OrderSide.SELL,
                     order_type=OrderType.LIMIT,
@@ -417,8 +544,8 @@ class NGXQuantTradingEngine:
             # 5. Cycle Completion & Multi-Stock Repeat
             exec_sell_price = filled_sell.average_fill_price or target_sell_price
             gross_revenue = exec_quantity * exec_sell_price
-            exit_fee = round(gross_revenue * (strat.exit_fee_pct / 100.0), 2)
-            entry_fee = round(exec_quantity * exec_buy_price * (strat.entry_fee_pct / 100.0), 2)
+            exit_fee = filled_sell.fee_incurred
+            entry_fee = filled_buy.fee_incurred
             total_fees = entry_fee + exit_fee
 
             net_revenue = gross_revenue - exit_fee
@@ -472,13 +599,20 @@ class NGXQuantTradingEngine:
         if self._running:
             raise RuntimeError("Trading engine is already running.")
         self._running = True
+        self.last_error = None
+        lease = InstanceLock(self.db.db_path)
         try:
+            lease.acquire()
             await self.db.initialize()
             for symbol in self.config.watchlists:
                 self._ensure_recoverable_state(symbol, await self.db.get_ticker_state(symbol))
 
             await self.broker.connect()
             initial_cash = await self.broker.get_cash_balance()
+            budget = sum(s.z_capital_budget_naira for s in self.config.watchlists.values())
+            if (not math.isfinite(initial_cash) or budget > initial_cash
+                    or budget > self.config.safety.max_total_budget_naira):
+                raise ValueError("Combined watchlist budget exceeds cash or the total capital limit.")
             logger.info("🏦 Connected to Broker. Initial Cash: ₦%s", f"{initial_cash:,.2f}")
 
             async with asyncio.TaskGroup() as tg:
@@ -495,9 +629,15 @@ class NGXQuantTradingEngine:
             self._running = False
             self._worker_tasks.clear()
             try:
-                await self.broker.disconnect()
+                await self._cancel_known_orders()
             finally:
-                await self.db.close()
+                try:
+                    await self.broker.disconnect()
+                finally:
+                    try:
+                        await self.db.close()
+                    finally:
+                        lease.release()
 
     async def stop(self) -> None:
         self._running = False

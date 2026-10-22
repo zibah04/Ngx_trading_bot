@@ -8,6 +8,8 @@ venv/
 *.db
 *.db-shm
 *.db-wal
+*.db.lock
+backups/
 data/
 .pytest_cache/
 .mypy_cache/

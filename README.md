@@ -55,5 +55,29 @@ This flag is only a guard against accidental selection. It does **not** mean a b
 
 - If saved state contains an open/pending order or held shares, startup stops and requires reconciliation with the broker. This is deliberate; the app does not automatically adopt or cancel broker-side orders.
 - SQLite is intended for a single application instance on local/persistent storage, not multiple replicas or a network filesystem.
-- The configured price-limit setting is not currently an implemented circuit breaker.
+- Daily price bands are enforced against a required previous close; this is not a stop-loss or a guarantee of broker/exchange compliance.
 - Configure and verify database backups, monitoring, access control, and recovery procedures for your deployment environment.
+
+## Private deployment and live-trading preparation
+
+Use the [private deployment runbook](deploy/README.md) for authenticated HTTPS hosting,
+backup/restore procedures, monitoring, and recovery. `compose.private.yaml` exposes only Caddy
+on ports 80/443 and keeps the dashboard internal. `.env.example` lists its required settings.
+The dashboard is a shared mock account; all authorized viewers can operate it.
+
+The [live release gates](deploy/LIVE_READINESS.md) describe the remaining broker verification,
+reconciliation, stop-loss, loss limits, monitoring, and security work before funded use.
+
+For Linux/macOS development:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+streamlit run ui_app.py --server.address=127.0.0.1 --browser.gatherUsageStats=false
+```
+
+Each dashboard run has its own archived SQLite file, because the mock broker is in memory.
+Use **New simulation** after stopping a run to get fresh mock cash without deleting old records.
+The CLI uses its explicit database path and continues to require reconciliation of unresolved state.

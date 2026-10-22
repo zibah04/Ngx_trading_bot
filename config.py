@@ -3,6 +3,7 @@ NGX Algorithmic Trading Bot - Strategy & Broker Configuration
 """
 
 from dataclasses import dataclass, field
+import math
 from typing import Dict, Optional
 
 
@@ -20,13 +21,19 @@ class TickerStrategyConfig:
     order_timeout_seconds: float = 600.0
 
     def __post_init__(self) -> None:
+        numeric = (self.x_buy_discount_pct, self.y_profit_target_pct,
+                   self.z_capital_budget_naira, self.entry_fee_pct, self.exit_fee_pct,
+                   self.min_order_interval_seconds, self.fill_polling_interval_seconds,
+                   self.order_timeout_seconds)
+        if not all(math.isfinite(value) for value in numeric):
+            raise ValueError("Strategy values must be finite.")
         if not self.symbol or self.symbol != self.symbol.strip().upper():
             raise ValueError("Symbol must be non-empty uppercase text without surrounding whitespace.")
         if not 0 <= self.x_buy_discount_pct < 100:
             raise ValueError("Buy discount must be between 0 and 100 percent.")
         if self.y_profit_target_pct < 0 or self.z_capital_budget_naira <= 0:
             raise ValueError("Profit target must be non-negative and budget must be positive.")
-        if self.n_cycle_count < 1:
+        if type(self.n_cycle_count) is not int or self.n_cycle_count < 1:
             raise ValueError("Cycle count must be at least 1.")
         if not 0 <= self.entry_fee_pct < 100 or not 0 <= self.exit_fee_pct < 100:
             raise ValueError("Fee percentages must be between 0 and 100.")
@@ -41,13 +48,24 @@ class TickerStrategyConfig:
 @dataclass
 class BotSafetyConfig:
     enable_kill_switch: bool = False
-    daily_price_limit_pct: float = 10.0   # NGX daily circuit breaker +/- 10%
+    daily_price_limit_pct: float = 10.0   # Requires a broker-supplied previous close
     network_retry_max_attempts: int = 5
     network_retry_backoff_factor: float = 1.5
     database_path: str = "ngx_trading_bot.db"
+    max_quote_age_seconds: float = 10.0
+    max_spread_pct: float = 5.0
+    max_total_budget_naira: float = 1_000_000.0
+    cancellation_timeout_seconds: float = 10.0
 
     def __post_init__(self) -> None:
-        if self.network_retry_max_attempts < 1:
+        limits = (self.daily_price_limit_pct, self.max_quote_age_seconds,
+                  self.max_spread_pct, self.max_total_budget_naira,
+                  self.cancellation_timeout_seconds, self.network_retry_backoff_factor)
+        if not all(math.isfinite(value) and value > 0 for value in limits):
+            raise ValueError("Safety limits must be finite and positive.")
+        if not 0 < self.daily_price_limit_pct < 100:
+            raise ValueError("Daily price limit must be below 100 percent.")
+        if type(self.network_retry_max_attempts) is not int or self.network_retry_max_attempts < 1:
             raise ValueError("Network retry attempts must be at least 1.")
         if self.network_retry_backoff_factor < 1:
             raise ValueError("Network retry backoff factor must be at least 1.")
