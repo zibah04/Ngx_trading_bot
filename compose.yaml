@@ -1,0 +1,18 @@
+services:
+  dashboard:
+    build: .
+    restart: unless-stopped
+    environment:
+      NGX_DATABASE_PATH: /app/data/ngx_dashboard.db
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ngx-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  ngx-data:
