@@ -1,0 +1,13 @@
+TradeAssist AI v0.1
+=====================
+1) Extract ZIP.
+2) Open folder in VS Code; Terminal -> New Terminal.
+3) Windows: py -m venv .venv
+4) Windows: .venv\Scripts\Activate.ps1
+5) pip install -r requirements.txt
+6) streamlit run app.py
+7) Synthetic demo opens without an API key; those stocks/prices are FAKE.
+8) CSV upload accepts your own licensed OHLCV files.
+9) Investo API requires a free or paid provider key (EOD only).
+10) Click "Record current BUY/SELL alerts", later load fresh bars, then "Evaluate pending alerts".
+No real trades are made. Please read README.md for caveats.

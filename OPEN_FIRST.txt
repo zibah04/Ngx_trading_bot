@@ -1,0 +1,9 @@
+TRADEASSIST AI — SINGLE-DOWNLOAD DEVELOPER BUNDLE
+
+1. This ZIP has the dashboard, Python code, tests, Windows launcher, Codex handoff, and resource links.
+2. Install Python 3.11 or 3.12 if needed: https://www.python.org/downloads/
+3. Extract the ZIP and run RUN_ON_WINDOWS.bat (requires Internet to install libraries).
+4. For Cloud Codex, upload project files to GitHub and see HANDOFF_TO_CODEX.md.
+5. Real NGX prices are NOT included. You need a valid provider API key or properly licensed CSV.
+
+No broker execution. Demo prices are fictional. No forecast probabilities are calibrated.

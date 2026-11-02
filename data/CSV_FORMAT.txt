@@ -1,0 +1,16 @@
+Required CSV columns:
+date or timestamp,close
+
+Suggested full daily columns:
+date,symbol,open,high,low,close,volume
+2026-10-28,EXAMPLE_ONLY,100.0,103.0,99.0,101.0,100000
+2026-10-29,EXAMPLE_ONLY,101.0,104.0,100.0,102.0,105000
+
+Intraday columns (same schema, with full timestamps):
+timestamp,symbol,open,high,low,close,volume
+2026-10-29 09:05:00,EXAMPLE_ONLY,100,102,99,101,2200
+2026-10-29 09:10:00,EXAMPLE_ONLY,101,103,100,102,2400
+
+The example values here are fictional. A single or two records are NOT sufficient
+to calculate technical indicators. Import at least 35 real observations per stock.
+Only use datasets you are licensed to use.
